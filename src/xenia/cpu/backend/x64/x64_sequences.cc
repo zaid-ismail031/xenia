@@ -35,6 +35,7 @@
 #include "xenia/cpu/backend/x64/x64_emitter.h"
 #include "xenia/cpu/backend/x64/x64_op.h"
 #include "xenia/cpu/backend/x64/x64_tracers.h"
+#include "xenia/cpu/backend/x64/x64_util.h"
 #include "xenia/cpu/hir/hir_builder.h"
 #include "xenia/cpu/processor.h"
 
@@ -697,6 +698,26 @@ struct SELECT_F64
     : Sequence<SELECT_F64, I<OPCODE_SELECT, F64Op, I8Op, F64Op, F64Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     // dest = src1 != 0 ? src2 : src3
+
+    if (e.IsFeatureEnabled(kX64EmitAVX512Ortho)) {
+      e.movzx(e.rax, i.src1);
+      e.vmovq(e.xmm0, e.rax);
+      e.vptestmq(e.k1, e.xmm0, e.xmm0);
+
+      const Xmm src2 = i.src2.is_constant ? e.xmm1 : i.src2;
+      if (i.src2.is_constant) {
+        e.LoadConstantXmm(src2, i.src2.constant());
+      }
+
+      const Xmm src3 = i.src3.is_constant ? e.xmm2 : i.src3;
+      if (i.src3.is_constant) {
+        e.LoadConstantXmm(src3, i.src3.constant());
+      }
+
+      e.vpblendmq(i.dest.reg() | e.k1, src3, src2);
+      return;
+    }
+
     e.movzx(e.eax, i.src1);
     e.vmovd(e.xmm1, e.eax);
     e.vpxor(e.xmm0, e.xmm0);
@@ -745,19 +766,28 @@ struct SELECT_V128_V128
     : Sequence<SELECT_V128_V128,
                I<OPCODE_SELECT, V128Op, V128Op, V128Op, V128Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
-    Xmm src1 = i.src1.is_constant ? e.xmm0 : i.src1;
+    const Xmm src1 = i.src1.is_constant ? e.xmm0 : i.src1;
     if (i.src1.is_constant) {
       e.LoadConstantXmm(src1, i.src1.constant());
     }
 
-    Xmm src2 = i.src2.is_constant ? e.xmm1 : i.src2;
+    const Xmm src2 = i.src2.is_constant ? e.xmm1 : i.src2;
     if (i.src2.is_constant) {
       e.LoadConstantXmm(src2, i.src2.constant());
     }
 
-    Xmm src3 = i.src3.is_constant ? e.xmm2 : i.src3;
+    const Xmm src3 = i.src3.is_constant ? e.xmm2 : i.src3;
     if (i.src3.is_constant) {
       e.LoadConstantXmm(src3, i.src3.constant());
+    }
+
+    if (e.IsFeatureEnabled(kX64EmitAVX512Ortho)) {
+      e.vmovdqa(e.xmm3, src1);
+      e.vpternlogd(e.xmm3, src2, src3,
+                   (~TernaryOperand::a & TernaryOperand::b) |
+                       (TernaryOperand::c & TernaryOperand::a));
+      e.vmovdqa(i.dest, e.xmm3);
+      return;
     }
 
     // src1 ? src2 : src3;
@@ -2667,34 +2697,28 @@ EMITTER_OPCODE_TABLE(OPCODE_AND, AND_I8, AND_I16, AND_I32, AND_I64, AND_V128);
 template <typename SEQ, typename REG, typename ARGS>
 void EmitAndNotXX(X64Emitter& e, const ARGS& i) {
   if (i.src1.is_constant) {
-    if (i.src2.is_constant) {
-      // Both constants.
-      e.mov(i.dest, i.src1.constant() & ~i.src2.constant());
-    } else {
-      // src1 constant.
+    // src1 constant.
+    // `and` instruction only supports up to 32-bit immediate constants
+    // 64-bit constants will need a temp register
+    if (i.dest.reg().getBit() == 64) {
+      auto temp = GetTempReg<typename decltype(i.src1)::reg_type>(e);
+      e.mov(temp, i.src1.constant());
 
-      // `and` instruction only supports up to 32-bit immediate constants
-      // 64-bit constants will need a temp register
-      if (i.dest.reg().getBit() == 64) {
-        auto temp = GetTempReg<typename decltype(i.src1)::reg_type>(e);
-        e.mov(temp, i.src1.constant());
-
-        if (e.IsFeatureEnabled(kX64EmitBMI1)) {
-          if (i.dest.reg().getBit() == 64) {
-            e.andn(i.dest.reg().cvt64(), i.src2.reg().cvt64(), temp.cvt64());
-          } else {
-            e.andn(i.dest.reg().cvt32(), i.src2.reg().cvt32(), temp.cvt32());
-          }
+      if (e.IsFeatureEnabled(kX64EmitBMI1)) {
+        if (i.dest.reg().getBit() == 64) {
+          e.andn(i.dest.reg().cvt64(), i.src2.reg().cvt64(), temp.cvt64());
         } else {
-          e.mov(i.dest, i.src2);
-          e.not_(i.dest);
-          e.and_(i.dest, temp);
+          e.andn(i.dest.reg().cvt32(), i.src2.reg().cvt32(), temp.cvt32());
         }
       } else {
         e.mov(i.dest, i.src2);
         e.not_(i.dest);
-        e.and_(i.dest, uint32_t(i.src1.constant()));
+        e.and_(i.dest, temp);
       }
+    } else {
+      e.mov(i.dest, i.src2);
+      e.not_(i.dest);
+      e.and_(i.dest, uint32_t(i.src1.constant()));
     }
   } else if (i.src2.is_constant) {
     // src2 constant.
@@ -2891,6 +2915,10 @@ struct NOT_I64 : Sequence<NOT_I64, I<OPCODE_NOT, I64Op, I64Op>> {
 };
 struct NOT_V128 : Sequence<NOT_V128, I<OPCODE_NOT, V128Op, V128Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (e.IsFeatureEnabled(kX64EmitAVX512Ortho)) {
+      e.vpternlogd(i.dest, i.src1, i.src1, 0b01010101);
+      return;
+    }
     // dest = src ^ 0xFFFF...
     e.vpxor(i.dest, i.src1, e.GetXmmConstPtr(XMMFFFF /* FF... */));
   }

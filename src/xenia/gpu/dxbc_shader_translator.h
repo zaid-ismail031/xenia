@@ -20,6 +20,7 @@
 #include "xenia/base/string_buffer.h"
 #include "xenia/gpu/dxbc.h"
 #include "xenia/gpu/shader_translator.h"
+#include "xenia/gpu/ucode.h"
 #include "xenia/ui/graphics_provider.h"
 
 namespace xe {
@@ -267,19 +268,6 @@ class DxbcShaderTranslator : public ShaderTranslator {
   };
   static_assert(kSysFlag_Count <= 32, "Too many flags in the system constants");
 
-  // Appended to the format in the format constant.
-  enum : uint32_t {
-    // Starting from bit 4 because the format itself needs 4 bits.
-    kRTFormatFlag_64bpp_Shift = 4,
-    // Requires clamping of blending sources and factors.
-    kRTFormatFlag_FixedPointColor_Shift,
-    kRTFormatFlag_FixedPointAlpha_Shift,
-
-    kRTFormatFlag_64bpp = 1u << kRTFormatFlag_64bpp_Shift,
-    kRTFormatFlag_FixedPointColor = 1u << kRTFormatFlag_FixedPointColor_Shift,
-    kRTFormatFlag_FixedPointAlpha = 1u << kRTFormatFlag_FixedPointAlpha_Shift,
-  };
-
   // IF SYSTEM CONSTANTS ARE CHANGED OR ADDED, THE FOLLOWING MUST BE UPDATED:
   // - SystemConstants::Index enum.
   // - system_constant_rdef_.
@@ -383,7 +371,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
 
     uint32_t edram_rt_base_dwords_scaled[4];
 
-    // RT format combined with kRTFormatFlags.
+    // RT format combined with RenderTargetCache::kPSIColorFormatFlag values
+    // (pass via RenderTargetCache::AddPSIColorFormatFlags).
     uint32_t edram_rt_format_flags[4];
 
     // Format info - values to clamp the color to before blending or storing.
@@ -524,40 +513,6 @@ class DxbcShaderTranslator : public ShaderTranslator {
     kEdram,
   };
 
-  // Returns the format with internal flags for passing via the
-  // edram_rt_format_flags system constant.
-  static constexpr uint32_t ROV_AddColorFormatFlags(
-      xenos::ColorRenderTargetFormat format) {
-    uint32_t format_flags = uint32_t(format);
-    if (format == xenos::ColorRenderTargetFormat::k_16_16_16_16 ||
-        format == xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT ||
-        format == xenos::ColorRenderTargetFormat::k_32_32_FLOAT) {
-      format_flags |= kRTFormatFlag_64bpp;
-    }
-    if (format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
-        format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA ||
-        format == xenos::ColorRenderTargetFormat::k_2_10_10_10 ||
-        format == xenos::ColorRenderTargetFormat::k_16_16 ||
-        format == xenos::ColorRenderTargetFormat::k_16_16_16_16 ||
-        format == xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10) {
-      format_flags |=
-          kRTFormatFlag_FixedPointColor | kRTFormatFlag_FixedPointAlpha;
-    } else if (format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
-               format == xenos::ColorRenderTargetFormat::
-                             k_2_10_10_10_FLOAT_AS_16_16_16_16) {
-      format_flags |= kRTFormatFlag_FixedPointAlpha;
-    }
-    return format_flags;
-  }
-  // Returns the bits that need to be added to the RT flags constant - needs to
-  // be done externally, not in SetColorFormatConstants, because the flags
-  // contain other state.
-  static void ROV_GetColorFormatSystemConstants(
-      xenos::ColorRenderTargetFormat format, uint32_t write_mask,
-      float& clamp_rgb_low, float& clamp_alpha_low, float& clamp_rgb_high,
-      float& clamp_alpha_high, uint32_t& keep_mask_low,
-      uint32_t& keep_mask_high);
-
   uint64_t GetDefaultVertexShaderModification(
       uint32_t dynamic_addressable_register_count,
       Shader::HostVertexShaderType host_vertex_shader_type =
@@ -635,13 +590,16 @@ class DxbcShaderTranslator : public ShaderTranslator {
   void ProcessLoopEndInstruction(
       const ParsedLoopEndInstruction& instr) override;
   void ProcessJumpInstruction(const ParsedJumpInstruction& instr) override;
-  void ProcessAllocInstruction(const ParsedAllocInstruction& instr) override;
+  void ProcessAllocInstruction(const ParsedAllocInstruction& instr,
+                               uint8_t export_eM) override;
 
   void ProcessVertexFetchInstruction(
       const ParsedVertexFetchInstruction& instr) override;
   void ProcessTextureFetchInstruction(
       const ParsedTextureFetchInstruction& instr) override;
-  void ProcessAluInstruction(const ParsedAluInstruction& instr) override;
+  void ProcessAluInstruction(
+      const ParsedAluInstruction& instr,
+      uint8_t memexport_eM_potentially_written_before) override;
 
  private:
   // IF ANY OF THESE ARE CHANGED, WriteInputSignature and WriteOutputSignature
@@ -720,6 +678,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // Frees the last allocated internal r# registers for later reuse.
   void PopSystemTemp(uint32_t count = 1);
 
+  // ExportToMemory modifies the values of eA/eM# for simplicity, call only
+  // before starting a new export or ending the invocation or making it
+  // inactive.
+  void ExportToMemory(uint8_t export_eM);
+
   // Converts one scalar from piecewise linear gamma to linear. The target may
   // be the same as the source, the temporary variables must be different. If
   // the source is not pre-saturated, saturation will be done internally.
@@ -772,8 +735,9 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // Whether it's possible and worth skipping running the translated shader for
   // 2x2 quads.
   bool ROV_IsDepthStencilEarly() const {
+    assert_true(edram_rov_used_);
     return !is_depth_only_pixel_shader_ && !current_shader().writes_depth() &&
-           !current_shader().is_valid_memexport_used();
+           !current_shader().memexport_eM_written();
   }
   // Converts the pre-clamped depth value to 24-bit (storing the result in bits
   // 0:23 and zeros in 24:31, not creating room for stencil - since this may be
@@ -832,14 +796,6 @@ class DxbcShaderTranslator : public ShaderTranslator {
   void StartPixelShader_LoadROVParameters();
   void StartPixelShader();
 
-  // Writing the epilogue.
-  // ExportToMemory modifies the values of eA/eM# for simplicity, don't call
-  // multiple times.
-  void ExportToMemory_PackFixed32(const uint32_t* eM_temps, uint32_t eM_count,
-                                  const uint32_t bits[4],
-                                  const dxbc::Src& is_integer,
-                                  const dxbc::Src& is_signed);
-  void ExportToMemory();
   void CompleteVertexOrDomainShader();
   // For RTV, adds the sample to coverage_temp.coverage_temp_component if it
   // passes alpha to mask (or, if initialize == true (for the first sample
@@ -962,11 +918,16 @@ class DxbcShaderTranslator : public ShaderTranslator {
         .SelectFromSwizzled(word_index & 1);
   }
 
-  void ProcessVectorAluOperation(const ParsedAluInstruction& instr,
-                                 uint32_t& result_swizzle,
-                                 bool& predicate_written);
-  void ProcessScalarAluOperation(const ParsedAluInstruction& instr,
-                                 bool& predicate_written);
+  void KillPixel(bool condition, const dxbc::Src& condition_src,
+                 uint8_t memexport_eM_potentially_written_before);
+
+  void ProcessVectorAluOperation(
+      const ParsedAluInstruction& instr,
+      uint8_t memexport_eM_potentially_written_before, uint32_t& result_swizzle,
+      bool& predicate_written);
+  void ProcessScalarAluOperation(
+      const ParsedAluInstruction& instr,
+      uint8_t memexport_eM_potentially_written_before, bool& predicate_written);
 
   void WriteResourceDefinition();
   void WriteInputSignature();
@@ -1167,14 +1128,16 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // writing).
   uint32_t system_temps_color_[4];
 
-  // Bits containing whether each eM# has been written, for up to 16 streams, or
-  // UINT32_MAX if memexport is not used. 8 bits (5 used) for each stream, with
-  // 4 `alloc export`s per component.
-  uint32_t system_temp_memexport_written_;
-  // eA in each `alloc export`, or UINT32_MAX if not used.
-  uint32_t system_temps_memexport_address_[Shader::kMaxMemExports];
-  // eM# in each `alloc export`, or UINT32_MAX if not used.
-  uint32_t system_temps_memexport_data_[Shader::kMaxMemExports][5];
+  // Memory export temporary registers are allocated if the shader writes any
+  // eM# (current_shader().memexport_eM_written() != 0).
+  // X - whether memexport is enabled for this invocation.
+  // Y - which eM# elements have been written so far by the invocation since the
+  //     last memory write.
+  uint32_t system_temp_memexport_enabled_and_eM_written_;
+  // eA.
+  uint32_t system_temp_memexport_address_;
+  // eM#.
+  uint32_t system_temps_memexport_data_[ucode::kMaxMemExportElementCount];
 
   // Vector ALU or fetch result / scratch (since Xenos write masks can contain
   // swizzles).
@@ -1238,10 +1201,6 @@ class DxbcShaderTranslator : public ShaderTranslator {
   uint32_t uav_index_edram_;
 
   std::vector<SamplerBinding> sampler_bindings_;
-
-  // Number of `alloc export`s encountered so far in the translation. The index
-  // of the current eA/eM# temp register set is this minus 1, if it's not 0.
-  uint32_t memexport_alloc_current_count_;
 };
 
 }  // namespace gpu
