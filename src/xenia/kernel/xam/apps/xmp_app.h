@@ -47,9 +47,9 @@ class XmpApp : public App {
     kUnknown = 0,
   };
   enum : XNotificationID {
-    kMsgStateChanged = 0x0A000001,
-    kMsgPlaybackBehaviorChanged = 0x0A000002,
-    kMsgPlaybackControllerChanged = 0x0A000003
+    kNotificationStateChanged = 0x0A000001,
+    kNotificationPlaybackBehaviorChanged = 0x0A000002,
+    kNotificationPlaybackControllerChanged = 0x0A000003,
   };
   struct Song {
     enum class Format : uint32_t {
